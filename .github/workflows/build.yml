@@ -59,15 +59,17 @@ jobs:
       - name: List outputs
         id: list
         run: |
-          find ipks
-          ls ipks | head -n 1 | awk -F"_" '{ print "usteer_version="$2 }' >> "$GITHUB_OUTPUT"
+          v=$(ls ipks/usteer_*.ipk | head -n 1 | awk -F"_" '{print $2}')
+          echo "usteer_version=$v" >> "$GITHUB_OUTPUT"
+          echo "usteer_version_tag=${v//[^A-Za-z0-9._-]/-}" >> "$GITHUB_OUTPUT"
     
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
-          tag_name: v${{ steps.list.outputs.usteer_version }}_${{ github.event.inputs.openwrt_version }}_${{ github.run_number }}
+          tag_name: v${{ steps.list.outputs.usteer_version_tag }}_${{ github.event.inputs.openwrt_version }}_${{ github.run_number }}
           body: |
-            usteer v${{ steps.list.outputs.usteer_version }} OpenWrt ${{ github.event.inputs.openwrt_version }} build
+            usteer v${{ steps.list.outputs.usteer_version }}
+            OpenWrt ${{ github.event.inputs.openwrt_version }} build
           files: |
             ipks/*
