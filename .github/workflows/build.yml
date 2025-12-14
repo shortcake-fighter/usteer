@@ -31,7 +31,7 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}-${{ github.event.inputs.openwrt_version }}
           V: sc
-          PACKAGES: usteer
+          PACKAGES: usteer luci-app-usteer
 
       - name: List outputs
         run: |
