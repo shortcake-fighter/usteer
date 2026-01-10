@@ -23,6 +23,9 @@
 #ifdef linux
 #include <netinet/ether.h>
 #endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "usteer.h"
 #include "node.h"
@@ -30,6 +33,81 @@
 
 static struct blob_buf b;
 static KVLIST(host_info, kvlist_blob_len);
+
+static void
+usteer_hex2bin(const char *hex, uint8_t *bin, int len)
+{
+	int i;
+	unsigned int val;
+	for (i = 0; i < len; i++) {
+		sscanf(hex + 2 * i, "%02x", &val);
+		bin[i] = val;
+	}
+}
+
+static void
+usteer_bin2hex(const uint8_t *bin, char *hex, int len)
+{
+	int i;
+	for (i = 0; i < len; i++) {
+		sprintf(hex + 2 * i, "%02x", bin[i]);
+	}
+}
+
+static char *
+usteer_create_high_pref_nr(const char *nr_hex)
+{
+	int hex_len = strlen(nr_hex);
+	int bin_len = hex_len / 2;
+	uint8_t *bin = malloc(bin_len + 3); // +3 for potential new subelement
+	int pos = 15;
+	int found = 0;
+	char *new_hex = NULL;
+
+	if (!bin) return NULL;
+
+	usteer_hex2bin(nr_hex, bin, bin_len);
+
+	// Validate generic NR header: ID=52 (0x34)
+	if (bin[0] != 0x34) {
+		free(bin);
+		return NULL;
+	}
+
+	// NR Body Fixed fields: 6(BSSID)+4(Info)+1(OpClass)+1(Ch)+1(Phy) = 13 bytes.
+	// Header is 2 bytes (ID, Len). So subelements start at 2 + 13 = 15.
+	while (pos < bin_len) {
+		uint8_t sub_id = bin[pos];
+		uint8_t sub_len = bin[pos+1];
+
+		if (sub_id == 3 && sub_len == 1) {
+			// Found Preference Subelement (ID 3), set to MAX (255)
+			bin[pos+2] = 255;
+			found = 1;
+			break;
+		}
+		pos += 2 + sub_len;
+	}
+
+	if (!found) {
+		// Append Preference Subelement if it fits (Max Body Len 255)
+		// bin[1] is the Length of the Body
+		if (bin[1] + 3 <= 255) {
+			bin[pos] = 3; // SubID
+			bin[pos+1] = 1; // SubLen
+			bin[pos+2] = 255; // Pref
+			bin_len += 3;
+			bin[1] += 3; // Update NR Element Length
+		}
+	}
+
+	new_hex = malloc(bin_len * 2 + 1);
+	if (new_hex) {
+		usteer_bin2hex(bin, new_hex, bin_len);
+	}
+	free(bin);
+	return new_hex;
+}
 
 static void *
 blobmsg_open_table_mac(struct blob_buf *buf, uint8_t *addr)
@@ -622,9 +700,17 @@ usteer_add_nr_entry(struct usteer_node *ln, struct usteer_node *node)
 	if (!tb[2])
 		return false;
 
-	blobmsg_add_field(&b, BLOBMSG_TYPE_STRING, "",
-			  blobmsg_data(tb[2]),
-			  blobmsg_data_len(tb[2]));
+	char *new_nr = usteer_create_high_pref_nr(blobmsg_data(tb[2]));
+	if (new_nr) {
+		blobmsg_add_field(&b, BLOBMSG_TYPE_STRING, "",
+				  new_nr,
+				  strlen(new_nr) + 1);
+		free(new_nr);
+	} else {
+		blobmsg_add_field(&b, BLOBMSG_TYPE_STRING, "",
+				  blobmsg_data(tb[2]),
+				  blobmsg_data_len(tb[2]));
+	}
 	
 	return true;
 }
@@ -686,14 +772,15 @@ int usteer_ubus_bss_transition_request(struct sta_info *si,
 	blobmsg_add_u8(&b, "disassociation_imminent", disassoc_imminent);
 	if (disassoc_imminent) {
 		blobmsg_add_u32(&b, "disassociation_timer", disassoc_timer);
+		blobmsg_add_u32(&b, "reassoc_delay", config.reassociation_delay);
 	}
 	blobmsg_add_u8(&b, "abridged", abridged);
 	blobmsg_add_u32(&b, "validity_period", validity_period);
 	blobmsg_add_u32(&b, "mbo_reason", 5);
-	blobmsg_add_u32(&b, "reassoc_delay", config.reassociation_delay);
+	blobmsg_add_u8(&b, "disassoc", false);
 
 	if (!target_node) {
-		/* Add all known neighbors if no specific target set */
+		// Add all known neighbors if no specific target set
 		MSG(VERBOSE, "roaming station " MAC_ADDR_FMT " without target\n", MAC_ADDR_DATA(si->sta->addr));
 		usteer_ubus_disassoc_add_neighbors(si);
 	} else {
@@ -720,11 +807,12 @@ int usteer_ubus_band_steering_request(struct sta_info *si,
 	blobmsg_add_u8(&b, "disassociation_imminent", disassoc_imminent);
 	if (disassoc_imminent) {
 		blobmsg_add_u32(&b, "disassociation_timer", disassoc_timer);
+		blobmsg_add_u32(&b, "reassoc_delay", config.reassociation_delay);
 	}
 	blobmsg_add_u8(&b, "abridged", abridged);
 	blobmsg_add_u32(&b, "validity_period", validity_period);
 	blobmsg_add_u32(&b, "mbo_reason", 5);
-	blobmsg_add_u32(&b, "reassoc_delay", config.reassociation_delay);
+	blobmsg_add_u8(&b, "disassoc", false);
 
 	c = blobmsg_open_array(&b, "neighbors");
 	for_each_local_node(node) {
