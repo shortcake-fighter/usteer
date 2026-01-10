@@ -5,7 +5,7 @@ on:
     inputs:
       openwrt_version:
        description: 'OpenWrt version'
-       default: '24.10.0'
+       default: 'main'
        required: true
        type: string
   
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ls-${{ matrix.arch }}
-          path: bin/packages/${{ matrix.arch }}/action/*.ipk
+          path: bin/packages/${{ matrix.arch }}/action/*.apk
 
   release:
 
@@ -52,14 +52,14 @@ jobs:
     
       - uses: actions/download-artifact@v4
         with:
-          path: ipks
+          path: apks
           pattern: ls-*
           merge-multiple: true
           
       - name: List outputs
         id: list
         run: |
-          v=$(ls ipks/usteer_*.ipk | head -n 1 | awk -F"_" '{print $2}')
+          v=$(ls apks/usteer_*.apk | head -n 1 | awk -F"_" '{print $2}')
           echo "usteer_version=$v" >> "$GITHUB_OUTPUT"
           echo "usteer_version_tag=${v//[^A-Za-z0-9._-]/-}" >> "$GITHUB_OUTPUT"
     
