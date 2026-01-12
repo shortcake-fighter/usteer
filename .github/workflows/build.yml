@@ -32,6 +32,7 @@ jobs:
           ARCH: ${{ matrix.arch }}-${{ github.event.inputs.openwrt_version }}
           V: sc
           PACKAGES: usteer luci-app-usteer
+          CONFIG_PACKAGE_FORMAT_APK: y
 
       - name: List outputs
         run: |
@@ -72,4 +73,4 @@ jobs:
             usteer v${{ steps.list.outputs.usteer_version }}
             OpenWrt ${{ github.event.inputs.openwrt_version }} build
           files: |
-            ipks/*
+            apks/*

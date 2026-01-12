@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=usteer
-PKG_VERSION:=$(shell date "+%Y.%m.%d")
+PKG_VERSION:=PKG_VERSION:=$(shell git show -s --format=%cd --date=short | tr '-' '.')
 PKG_RELEASE:=1
 
 PKG_BUILD_DEPENDS:=libpcap
@@ -14,7 +14,7 @@ include $(INCLUDE_DIR)/cmake.mk
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	ln -s $(CURDIR)/../../.git $(PKG_BUILD_DIR)/.git
+	ln -sf $(CURDIR)/../../.git $(PKG_BUILD_DIR)/.git
 	cd $(PKG_BUILD_DIR) && git checkout .
 endef
 
