@@ -273,6 +273,9 @@ struct sta_info {
 	uint64_t roam_scan_start;
 	uint64_t roam_scan_timeout_start;
 
+	uint64_t bss_transition_request_timestamp;
+	uint8_t bss_transition_request_dialog_token;
+
 	struct {
 		uint8_t status_code;
 		uint64_t timestamp;

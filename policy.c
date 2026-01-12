@@ -374,6 +374,26 @@ usteer_roam_trigger_sm(struct usteer_local_node *ln, struct sta_info *si)
 		candidate = usteer_roam_sm_found_better_node(si, &ev, ROAM_TRIGGER_SCAN_DONE);
 		/* Kick back in case no better node is found */
 		if (!candidate) {
+			if (si->bss_transition) {
+				if (!si->roam_transition_start)
+					si->roam_transition_start = current_time;
+				si->roam_transition_request_validity_end = current_time + 10000;
+				validity_period = 10000 / usteer_local_node_get_beacon_interval(ln); /* ~ 10 seconds */
+				if (si->sta->aggressiveness >= 2) {
+					if (!si->kick_time)
+						si->kick_time = current_time + config.roam_kick_delay;
+					if (si->sta->aggressiveness >= 3)
+						disassoc_timer = (si->kick_time - current_time) / usteer_local_node_get_beacon_interval(ln);
+					else
+						disassoc_timer = 0;
+					usteer_ubus_bss_transition_request(si, 1, true, disassoc_timer, true, validity_period, NULL);
+					if (disassoc_timer < validity_period)
+						si->roam_transition_start = 0;
+				} else {
+					usteer_ubus_bss_transition_request(si, 1, false, 0, true, validity_period, NULL);
+				}
+			}
+
 			usteer_roam_set_state(si, ROAM_TRIGGER_IDLE, &ev);
 			break;
 		}

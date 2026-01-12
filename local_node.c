@@ -119,19 +119,21 @@ usteer_handle_bss_tm_query(struct usteer_local_node *ln, struct blob_attr *msg)
 	struct blob_attr *tb[__BSS_TM_QUERY_MAX];
 	struct usteer_bss_tm_query *query;
 	uint8_t *sta_addr;
+	const char *addr_str;
 
 	blobmsg_parse(policy, __BSS_TM_QUERY_MAX, tb, blob_data(msg), blob_len(msg));
 
 	if (!tb[BSS_TM_QUERY_ADDRESS] || !tb[BSS_TM_QUERY_DIALOG_TOKEN])
 		return 0;
 
+	addr_str = blobmsg_get_string(tb[BSS_TM_QUERY_ADDRESS]);
 	query = calloc(1, sizeof(*query));
 	if (!query)
 		return 0;
 
 	query->dialog_token = blobmsg_get_u8(tb[BSS_TM_QUERY_DIALOG_TOKEN]);
 
-	sta_addr = (uint8_t *) ether_aton(blobmsg_get_string(tb[BSS_TM_QUERY_ADDRESS]));
+	sta_addr = (uint8_t *) ether_aton(addr_str);
 	if (!sta_addr)
 		return 0;
 
@@ -139,6 +141,10 @@ usteer_handle_bss_tm_query(struct usteer_local_node *ln, struct blob_attr *msg)
 
 	list_add(&query->list, &ln->bss_tm_queries);
 	uloop_timeout_set(&ln->bss_tm_queries_timeout, 1);
+
+	MSG(VERBOSE, "bss transition query received sta=%s dialog_token=%u candidate_list=%s\n",
+	    addr_str, query->dialog_token,
+	    tb[BSS_TM_QUERY_CANDIDATE_LIST] ? "present" : "none");
 
 	return 1;
 }
@@ -180,6 +186,22 @@ usteer_handle_bss_tm_response(struct usteer_local_node *ln, struct blob_attr *ms
 	si->bss_transition_response.status_code = blobmsg_get_u8(tb[BSS_TM_RESPONSE_STATUS_CODE]);
 	si->bss_transition_response.timestamp = current_time;
 
+	if (si->bss_transition_request_timestamp) {
+		uint64_t age_ms = current_time - si->bss_transition_request_timestamp;
+
+		MSG(VERBOSE,
+		    "bss transition response received sta=" MAC_ADDR_FMT " node=%s status=%u age_ms=%llu last_dialog_token=%u\n",
+		    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node),
+		    si->bss_transition_response.status_code,
+		    (unsigned long long) age_ms,
+		    si->bss_transition_request_dialog_token);
+	} else {
+		MSG(VERBOSE,
+		    "bss transition response received sta=" MAC_ADDR_FMT " node=%s status=%u age_ms=unknown\n",
+		    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node),
+		    si->bss_transition_response.status_code);
+	}
+
 	if (si->bss_transition_response.status_code && si->kick_time && si->sta->aggressiveness) {
 		/* Cancel imminent kick in case BSS transition was rejected */
 		si->kick_time = 0;
@@ -207,8 +229,12 @@ usteer_local_node_handle_beacon_report(struct usteer_local_node *ln, struct blob
 	};
 	struct blob_attr *tb[__BR_MAX];
 	struct usteer_node *node;
+	struct usteer_measurement_report *mr;
+	struct sta_info *si;
+	bool create = false;
 	uint8_t *addr;
 	struct sta *sta;
+	int rssi;
 
 	blobmsg_parse(policy, __BR_MAX, tb, blob_data(msg), blob_len(msg));
 	if (!tb[BR_ADDRESS] || !tb[BR_BSSID] || !tb[BR_RCPI] || !tb[BR_RSNI])
@@ -230,10 +256,21 @@ usteer_local_node_handle_beacon_report(struct usteer_local_node *ln, struct blob
 	if (!node)
 		return 0;
 
-	usteer_measurement_report_add(sta, node,
-				      (uint8_t)blobmsg_get_u16(tb[BR_RCPI]),
-				      (uint8_t)blobmsg_get_u16(tb[BR_RSNI]),
-				      current_time);
+	mr = usteer_measurement_report_add(sta, node,
+					   (uint8_t)blobmsg_get_u16(tb[BR_RCPI]),
+					   (uint8_t)blobmsg_get_u16(tb[BR_RSNI]),
+					   current_time);
+	if (!mr)
+		return 0;
+
+	si = usteer_sta_info_get(sta, node, &create);
+	if (!si)
+		return 0;
+
+	rssi = usteer_measurement_get_rssi(mr);
+	usteer_sta_info_update(si, rssi, true);
+	if (create)
+		usteer_send_sta_update(si);
 	return 0;
 }
 
@@ -404,6 +441,7 @@ usteer_local_node_update_sta_rrm_wnm(struct sta_info *si, struct blob_attr *clie
 	struct blob_attr *mbo_blob = NULL, *rrm_blob = NULL, *wnm_blob = NULL, *cur;
 	int rem;
 	int i = 0;
+	bool bss_transition = false;
 
 	/* MBO */
 	blobmsg_parse(&mbo_policy, 1, &mbo_blob, blobmsg_data(client_attr), blobmsg_data_len(client_attr));
@@ -412,30 +450,37 @@ usteer_local_node_update_sta_rrm_wnm(struct sta_info *si, struct blob_attr *clie
 		si->mbo = blobmsg_get_u8(mbo_blob);
 	else
 		si->mbo = false;
+	if (si->mbo)
+		bss_transition = true;
 
 	/* RRM */
 	blobmsg_parse(&rrm_policy, 1, &rrm_blob, blobmsg_data(client_attr), blobmsg_data_len(client_attr));
-	if (!rrm_blob)
-		return;
-
-	si->rrm = blobmsg_get_u32(blobmsg_data(rrm_blob));
+	if (rrm_blob)
+		si->rrm = blobmsg_get_u32(blobmsg_data(rrm_blob));
+	else
+		si->rrm = 0;
 
 	/* Extended Capabilities / WNM */
 	blobmsg_parse(&ext_capa_policy, 1, &wnm_blob, blobmsg_data(client_attr), blobmsg_data_len(client_attr));
-	if (!wnm_blob)
-		return;
+	if (wnm_blob) {
+		blobmsg_for_each_attr(cur, wnm_blob, rem) {
+			uint32_t octet;
 
-	blobmsg_for_each_attr(cur, wnm_blob, rem) {
-		if (blobmsg_type(cur) != BLOBMSG_TYPE_INT32)
-			return;
-		
-		if (i == 2) {
-			if (blobmsg_get_u32(cur) & (1 << 3))
-				si->bss_transition = true;
+			if (blobmsg_type(cur) == BLOBMSG_TYPE_INT32)
+				octet = blobmsg_get_u32(cur);
+			else if (blobmsg_type(cur) == BLOBMSG_TYPE_INT8)
+				octet = blobmsg_get_u8(cur);
+			else
+				continue;
+
+			if (i == 2 && (octet & (1 << 3)))
+				bss_transition = true;
+
+			i++;
 		}
-
-		i++;
 	}
+
+	si->bss_transition = bss_transition;
 }
 
 static void
@@ -734,6 +779,7 @@ usteer_local_node_process_bss_tm_queries(struct uloop_timeout *timeout)
 	struct sta_info *si;
 	struct sta *sta;
 	uint8_t validity_period;
+	int queued = 0;
 
 	ln = container_of(timeout, struct usteer_local_node, bss_tm_queries_timeout);
 	node = &ln->node;
@@ -741,19 +787,32 @@ usteer_local_node_process_bss_tm_queries(struct uloop_timeout *timeout)
 	validity_period = 10000 / usteer_local_node_get_beacon_interval(ln); /* ~ 10 seconds */
 
 	list_for_each_entry_safe(query, tmp, &ln->bss_tm_queries, list) {
+		queued++;
 		sta = usteer_sta_get(query->sta_addr, false);
-		if (!sta)
+		if (!sta) {
+			MSG(DEBUG, "bss transition query drop: sta=" MAC_ADDR_FMT " not found\n",
+			    MAC_ADDR_DATA(query->sta_addr));
 			continue;
+		}
 
 		si = usteer_sta_info_get(sta, node, false);
-		if (!si)
+		if (!si) {
+			MSG(DEBUG, "bss transition query drop: sta=" MAC_ADDR_FMT " no sta_info on node=%s\n",
+			    MAC_ADDR_DATA(query->sta_addr), usteer_node_name(node));
 			continue;
+		}
 
+		MSG(DEBUG, "bss transition query processing sta=" MAC_ADDR_FMT " node=%s dialog_token=%u validity=%u\n",
+		    MAC_ADDR_DATA(query->sta_addr), usteer_node_name(node),
+		    query->dialog_token, validity_period);
 		usteer_ubus_bss_transition_request(si, query->dialog_token, false, 0, true, validity_period, NULL);
 	}
 
 	/* Free pending queries we can not handle */
 	usteer_local_node_pending_bss_tm_free(ln);
+
+	MSG(DEBUG, "bss transition query processing complete node=%s queued=%d\n",
+	    usteer_node_name(node), queued);
 }
 
 static struct usteer_local_node *

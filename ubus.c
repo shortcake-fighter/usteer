@@ -685,20 +685,32 @@ usteer_add_nr_entry(struct usteer_node *ln, struct usteer_node *node)
 	};
 	struct blob_attr *tb[3];
 
-	if (!node->rrm_nr)
+	if (!node->rrm_nr) {
+		MSG(DEBUG, "bss transition neighbor skip: node=%s missing rrm_nr\n",
+		    usteer_node_name(node));
 		return false;
+	}
 
-	if (strcmp(ln->ssid, node->ssid) != 0)
+	if (strcmp(ln->ssid, node->ssid) != 0) {
+		MSG(DEBUG, "bss transition neighbor skip: node=%s ssid mismatch (%s != %s)\n",
+		    usteer_node_name(node), ln->ssid, node->ssid);
 		return false;
+	}
 
-	if (!usteer_policy_node_below_max_assoc(node))
+	if (!usteer_policy_node_below_max_assoc(node)) {
+		MSG(DEBUG, "bss transition neighbor skip: node=%s at max assoc\n",
+		    usteer_node_name(node));
 		return false;
+	}
 
 	blobmsg_parse_array(policy, ARRAY_SIZE(tb), tb,
 			    blobmsg_data(node->rrm_nr),
 			    blobmsg_data_len(node->rrm_nr));
-	if (!tb[2])
+	if (!tb[2]) {
+		MSG(DEBUG, "bss transition neighbor skip: node=%s missing nr entry\n",
+		    usteer_node_name(node));
 		return false;
+	}
 
 	char *new_nr = usteer_create_high_pref_nr(blobmsg_data(tb[2]));
 	if (new_nr) {
@@ -711,38 +723,47 @@ usteer_add_nr_entry(struct usteer_node *ln, struct usteer_node *node)
 				  blobmsg_data(tb[2]),
 				  blobmsg_data_len(tb[2]));
 	}
-	
+
+	MSG(DEBUG, "bss transition neighbor added: node=%s bssid=" MAC_ADDR_FMT "\n",
+	    usteer_node_name(node), MAC_ADDR_DATA(node->bssid));
 	return true;
 }
 
-static void
+static bool
 usteer_ubus_disassoc_add_neighbor(struct sta_info *si, struct usteer_node *node)
 {
 	void *c;
+	bool added;
 
 	c = blobmsg_open_array(&b, "neighbors");
-	usteer_add_nr_entry(si->node, node);
+	added = usteer_add_nr_entry(si->node, node);
 	blobmsg_close_array(&b, c);
+
+	MSG(DEBUG, "bss transition neighbor list: sta=" MAC_ADDR_FMT " target=%s added=%s\n",
+	    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(node),
+	    added ? "true" : "false");
+
+	return added;
 }
 
-static void
+static int
 usteer_ubus_disassoc_add_neighbors(struct sta_info *si)
 {
 	struct usteer_node *node, *last_remote_neighbor = NULL;
-	int i = 0;
+	int neighbors = 0;
 	void *c;
 
 	c = blobmsg_open_array(&b, "neighbors");
 	for_each_local_node(node) {
-		if (i >= config.max_neighbor_reports)
+		if (neighbors >= config.max_neighbor_reports)
 			break;
 		if (si->node == node)
 			continue;
 		if (usteer_add_nr_entry(si->node, node))
-			i++;
+			neighbors++;
 	}
 
-	while (i < config.max_neighbor_reports) {
+	while (neighbors < config.max_neighbor_reports) {
 		node = usteer_node_get_next_neighbor(si->node, last_remote_neighbor);
 		if (!node) {
 			/* No more nodes available */
@@ -751,9 +772,14 @@ usteer_ubus_disassoc_add_neighbors(struct sta_info *si)
 
 		last_remote_neighbor = node;
 		if (usteer_add_nr_entry(si->node, node))
-			i++;
+			neighbors++;
 	}
 	blobmsg_close_array(&b, c);
+
+	MSG(DEBUG, "bss transition neighbor list: sta=" MAC_ADDR_FMT " added=%d\n",
+	    MAC_ADDR_DATA(si->sta->addr), neighbors);
+
+	return neighbors;
 }
 
 int usteer_ubus_bss_transition_request(struct sta_info *si,
@@ -765,6 +791,13 @@ int usteer_ubus_bss_transition_request(struct sta_info *si,
                                        struct usteer_node *target_node)
 {
 	struct usteer_local_node *ln = container_of(si->node, struct usteer_local_node, node);
+	int neighbors = 0;
+	int ret;
+
+	MSG(DEBUG,
+	    "bss transition request build: sta=" MAC_ADDR_FMT " node=%s dialog_token=%u disassoc_imminent=%u disassoc_timer=%u abridged=%u validity=%u mbo=%u\n",
+	    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node), dialog_token,
+	    disassoc_imminent, disassoc_timer, abridged, validity_period, si->mbo);
 
 	blob_buf_init(&b, 0);
 	blobmsg_printf(&b, "addr", MAC_ADDR_FMT, MAC_ADDR_DATA(si->sta->addr));
@@ -776,18 +809,36 @@ int usteer_ubus_bss_transition_request(struct sta_info *si,
 	}
 	blobmsg_add_u8(&b, "abridged", abridged);
 	blobmsg_add_u32(&b, "validity_period", validity_period);
-	blobmsg_add_u32(&b, "mbo_reason", 5);
+	if (si->mbo)
+		blobmsg_add_u32(&b, "mbo_reason", 5);
 	blobmsg_add_u8(&b, "disassoc", false);
 
 	if (!target_node) {
 		// Add all known neighbors if no specific target set
 		MSG(VERBOSE, "roaming station " MAC_ADDR_FMT " without target\n", MAC_ADDR_DATA(si->sta->addr));
-		usteer_ubus_disassoc_add_neighbors(si);
+		neighbors = usteer_ubus_disassoc_add_neighbors(si);
 	} else {
 		MSG(VERBOSE, "roaming station " MAC_ADDR_FMT " to " MAC_ADDR_FMT " (%s) disassociation timer %u, signal %d\n", MAC_ADDR_DATA(si->sta->addr), MAC_ADDR_DATA(target_node->bssid), usteer_node_name(target_node), disassoc_timer, si->signal);
-		usteer_ubus_disassoc_add_neighbor(si, target_node);
+		neighbors = usteer_ubus_disassoc_add_neighbor(si, target_node) ? 1 : 0;
 	}
-	return ubus_invoke(ubus_ctx, ln->obj_id, "bss_transition_request", b.head, NULL, 0, 100);
+
+	MSG(DEBUG, "bss transition request neighbors=%d sta=" MAC_ADDR_FMT " node=%s\n",
+	    neighbors, MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node));
+	MSG(VERBOSE, "bss transition request sending sta=" MAC_ADDR_FMT " node=%s\n",
+	    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node));
+
+	ret = ubus_invoke(ubus_ctx, ln->obj_id, "bss_transition_request", b.head, NULL, 0, 100);
+	if (ret) {
+		MSG(INFO, "bss transition request failed sta=" MAC_ADDR_FMT " node=%s ret=%d\n",
+		    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node), ret);
+	} else {
+		si->bss_transition_request_timestamp = current_time;
+		si->bss_transition_request_dialog_token = dialog_token;
+		MSG(VERBOSE, "bss transition request sent sta=" MAC_ADDR_FMT " node=%s\n",
+		    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node));
+	}
+
+	return ret;
 }
 
 int usteer_ubus_band_steering_request(struct sta_info *si,
@@ -800,6 +851,13 @@ int usteer_ubus_band_steering_request(struct sta_info *si,
 	struct usteer_local_node *ln = container_of(si->node, struct usteer_local_node, node);
 	struct usteer_node *node;
 	void *c;
+	int neighbors = 0;
+	int ret;
+
+	MSG(DEBUG,
+	    "band steering request build: sta=" MAC_ADDR_FMT " node=%s dialog_token=%u disassoc_imminent=%u disassoc_timer=%u abridged=%u validity=%u mbo=%u\n",
+	    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node), dialog_token,
+	    disassoc_imminent, disassoc_timer, abridged, validity_period, si->mbo);
 
 	blob_buf_init(&b, 0);
 	blobmsg_printf(&b, "addr", MAC_ADDR_FMT, MAC_ADDR_DATA(si->sta->addr));
@@ -811,7 +869,8 @@ int usteer_ubus_band_steering_request(struct sta_info *si,
 	}
 	blobmsg_add_u8(&b, "abridged", abridged);
 	blobmsg_add_u32(&b, "validity_period", validity_period);
-	blobmsg_add_u32(&b, "mbo_reason", 5);
+	if (si->mbo)
+		blobmsg_add_u32(&b, "mbo_reason", 5);
 	blobmsg_add_u8(&b, "disassoc", false);
 
 	c = blobmsg_open_array(&b, "neighbors");
@@ -819,15 +878,31 @@ int usteer_ubus_band_steering_request(struct sta_info *si,
 		if (!usteer_band_steering_is_target(ln, node))
 			continue;
 	
-		usteer_add_nr_entry(si->node, node);
+		if (usteer_add_nr_entry(si->node, node))
+			neighbors++;
 		MSG(DEBUG, "band steering station " MAC_ADDR_FMT " adding neighbor " MAC_ADDR_FMT " (%s)\n", MAC_ADDR_DATA(si->sta->addr), MAC_ADDR_DATA(node->bssid), usteer_node_name(node));
 	}
 	blobmsg_close_array(&b, c);
-	if (sizeof(si->node) > 0) {
+	if (neighbors > 0) {
 		MSG(VERBOSE, "band steering station " MAC_ADDR_FMT " disassociation timer %u, signal %d\n", MAC_ADDR_DATA(si->sta->addr), disassoc_timer, si->signal);
-		return ubus_invoke(ubus_ctx, ln->obj_id, "bss_transition_request", b.head, NULL, 0, 100);
-	} else
+		MSG(VERBOSE, "band steering request sending sta=" MAC_ADDR_FMT " node=%s neighbors=%d\n",
+		    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node), neighbors);
+		ret = ubus_invoke(ubus_ctx, ln->obj_id, "bss_transition_request", b.head, NULL, 0, 100);
+		if (ret) {
+			MSG(INFO, "band steering request failed sta=" MAC_ADDR_FMT " node=%s ret=%d\n",
+			    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node), ret);
+		} else {
+			si->bss_transition_request_timestamp = current_time;
+			si->bss_transition_request_dialog_token = dialog_token;
+			MSG(VERBOSE, "band steering request sent sta=" MAC_ADDR_FMT " node=%s\n",
+			    MAC_ADDR_DATA(si->sta->addr), usteer_node_name(&ln->node));
+		}
+		return ret;
+	} else {
 		MSG(VERBOSE, "band steering no targets found for station " MAC_ADDR_FMT "\n", MAC_ADDR_DATA(si->sta->addr));
+	}
+
+	return 0;
 }
 
 int usteer_ubus_trigger_link_measurement(struct sta_info *si)
@@ -844,21 +919,62 @@ int usteer_ubus_trigger_link_measurement(struct sta_info *si)
 	return ubus_invoke(ubus_ctx, ln->obj_id, "link_measurement_req", b.head, NULL, 0, 100);
 }
 
+static bool
+usteer_pick_beacon_measurement_mode(struct sta_info *si, enum usteer_beacon_measurement_mode *mode)
+{
+	if (usteer_sta_supports_beacon_measurement_mode(si, BEACON_MEASUREMENT_ACTIVE)) {
+		*mode = BEACON_MEASUREMENT_ACTIVE;
+		return true;
+	}
+
+	if (usteer_sta_supports_beacon_measurement_mode(si, BEACON_MEASUREMENT_PASSIVE)) {
+		*mode = BEACON_MEASUREMENT_PASSIVE;
+		return true;
+	}
+
+	if (usteer_sta_supports_beacon_measurement_mode(si, BEACON_MEASUREMENT_TABLE)) {
+		*mode = BEACON_MEASUREMENT_TABLE;
+		return true;
+	}
+
+	return false;
+}
+
+static const char *
+usteer_beacon_measurement_mode_name(enum usteer_beacon_measurement_mode mode)
+{
+	switch (mode) {
+	case BEACON_MEASUREMENT_PASSIVE:
+		return "PASSIVE";
+	case BEACON_MEASUREMENT_ACTIVE:
+		return "ACTIVE";
+	case BEACON_MEASUREMENT_TABLE:
+		return "TABLE";
+	}
+
+	return "UNKNOWN";
+}
+
 int usteer_ubus_trigger_client_scan(struct sta_info *si)
 {
 	struct usteer_local_node *ln = container_of(si->node, struct usteer_local_node, node);
+	enum usteer_beacon_measurement_mode mode;
 
-	if (!usteer_sta_supports_beacon_measurement_mode(si, BEACON_MEASUREMENT_ACTIVE)) {
-		MSG(DEBUG, "STA does not support beacon measurement sta=" MAC_ADDR_FMT "\n", MAC_ADDR_DATA(si->sta->addr));
+	if (!usteer_pick_beacon_measurement_mode(si, &mode)) {
+		MSG(DEBUG, "STA does not support beacon measurement sta=" MAC_ADDR_FMT "\n",
+		    MAC_ADDR_DATA(si->sta->addr));
 		return 0;
 	}
 
 	si->scan_band = !si->scan_band;
 
+	MSG(DEBUG, "client scan request using %s mode sta=" MAC_ADDR_FMT "\n",
+	    usteer_beacon_measurement_mode_name(mode), MAC_ADDR_DATA(si->sta->addr));
+
 	blob_buf_init(&b, 0);
 	blobmsg_printf(&b, "addr", MAC_ADDR_FMT, MAC_ADDR_DATA(si->sta->addr));
 	blobmsg_add_string(&b, "ssid", si->node->ssid);
-	blobmsg_add_u32(&b, "mode", BEACON_MEASUREMENT_ACTIVE);
+	blobmsg_add_u32(&b, "mode", mode);
 	blobmsg_add_u32(&b, "duration", config.roam_scan_interval / 100);
 	blobmsg_add_u32(&b, "channel", 0);
 	blobmsg_add_u32(&b, "op_class", si->scan_band ? 1 : 12);
